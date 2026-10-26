@@ -1,0 +1,347 @@
+name: Kernel Build (Blossom 4.19 - Droidspaces & OpenClaw Optimal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_url:
+        description: "Kernel Git URL (4.19 blossom tree)"
+        required: true
+        default: "https://github.com/IsHacker-kernel/android_kernel_xiaomi_blossom"
+        type: string
+      kernel_branch:
+        description: "Kernel branch or tag to build"
+        required: true
+        default: "main"
+        type: string
+      defconfig:
+        description: "Defconfig name in arch/arm64/configs/"
+        required: true
+        default: "blossom_defconfig"
+        type: string
+      enable_ksu:
+        description: "Pasang KernelSU-Next? (Biarkan false jika tetap memakai Magisk)"
+        required: false
+        default: false
+        type: boolean
+      ksu_ref:
+        description: "KernelSU-Next branch/tag (kosongkan untuk default)"
+        required: false
+        default: ""
+        type: string
+      apply_droidspaces_patches:
+        description: "Terapkan patch kernel non-GKI resmi Droidspaces"
+        required: false
+        default: true
+        type: boolean
+      toolchain_url:
+        description: "Git repo Clang + binutils toolchain"
+        required: false
+        default: "https://github.com/kdrag0n/proton-clang"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AnyKernel3 Zip (Droidspaces Ready)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      KERNEL_URL: ${{ inputs.kernel_url }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      ENABLE_KSU: ${{ inputs.enable_ksu }}
+      KSU_REF: ${{ inputs.ksu_ref }}
+      TOOLCHAIN_URL: ${{ inputs.toolchain_url }}
+      KSU_SETUP_URL: "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh"
+      KBUILD_BUILD_USER: github-actions
+      KBUILD_BUILD_HOST: droidspaces-builder
+      MAKE_ARGS: >-
+        O=out ARCH=arm64 SUBARCH=arm64
+        CC=clang
+        CROSS_COMPILE=aarch64-linux-gnu-
+        CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        CLANG_TRIPLE=aarch64-linux-gnu-
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl device-tree-compiler \
+            dwarves flex gawk git kmod libelf-dev libncurses-dev libssl-dev lz4 \
+            patch python3 python-is-python3 rsync u-boot-tools unzip wget xz-utils zip zstd
+          for pkg in python2 libtinfo5 libncurses5; do
+            sudo apt-get install -y --no-install-recommends "$pkg" || true
+          done
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" "$KERNEL_URL" kernel
+          git -C kernel log -1 --format='Building %h  %s'
+
+      - name: Prepare tree & fix host-gcc dtc
+        working-directory: kernel
+        run: |
+          KVER="$(make -s kernelversion)"
+          echo "Kernel version: $KVER"
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            echo "::error::arch/arm64/configs/$DEFCONFIG tidak ditemukan! Kandidat yang tersedia:"
+            ls arch/arm64/configs | grep -Ei 'angelica|blossom|mt6765|dandelion' || true
+            exit 1
+          fi
+
+          for f in scripts/dtc/dtc-lexer.l scripts/dtc/dtc-lexer.lex.c_shipped; do
+            if [ -f "$f" ]; then sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' "$f"; fi
+          done
+
+      - name: Fetch Clang + binutils toolchain
+        run: |
+          git clone --depth=1 "$TOOLCHAIN_URL" clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          clang --version | sed -n '1p'
+
+      - name: Integrate KernelSU Next (Optional)
+        if: ${{ inputs.enable_ksu }}
+        working-directory: kernel
+        run: |
+          if [ -e drivers/kernelsu ] || [ -d KernelSU ] || [ -d KernelSU-Next ]; then
+            echo "::notice::Kernel tree sudah memiliki driver KernelSU"
+          elif [ -n "$KSU_REF" ]; then
+            curl -LSs "$KSU_SETUP_URL" | bash -s -- "$KSU_REF"
+          else
+            curl -LSs "$KSU_SETUP_URL" | bash -
+          fi
+
+      - name: Apply Droidspaces non-GKI kernel patches
+        if: ${{ inputs.apply_droidspaces_patches }}
+        run: |
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS "$RUNNER_TEMP/droidspaces"
+          PDIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
+          if [ ! -d "$PDIR" ]; then
+            echo "::warning::Folder patch tidak ditemukan - melewati patch Droidspaces"
+            exit 0
+          fi
+          cd kernel
+          shopt -s nullglob
+          applied=0
+          skipped=0
+          for p in "$PDIR"/*.patch; do
+            if patch -p1 -N --dry-run -s < "$p" > /dev/null 2>&1; then
+              patch -p1 -N -s < "$p"
+              echo "Applied: $(basename "$p")"
+              applied=$((applied + 1))
+            else
+              echo "::warning::Skipped (already applied or conflict): $(basename "$p")"
+              skipped=$((skipped + 1))
+            fi
+          done
+          echo "Droidspaces patches: $applied applied, $skipped skipped"
+
+      - name: Generate base .config & Inject Droidspaces Configurations
+        working-directory: kernel
+        run: |
+          # 1. Buat base .config dari defconfig
+          make $MAKE_ARGS "$DEFCONFIG"
+
+          # 2. Pastikan syarat Kconfig terbuka jika diblokir oleh !ANDROID
+          sed -i 's/depends on !ANDROID//g' init/Kconfig || true
+
+          # 3. Gunakan scripts/config untuk mengaktifkan fitur wajib Droidspaces & LXC/Docker
+          ./scripts/config --file out/.config \
+            --disable ANDROID_PARANOID_NETWORK \
+            --enable MULTIUSER \
+            --enable NAMESPACES \
+            --enable UTS_NS \
+            --enable IPC_NS \
+            --enable USER_NS \
+            --enable PID_NS \
+            --enable NET_NS \
+            --enable SYSVIPC \
+            --enable POSIX_MQUEUE \
+            --enable SECCOMP \
+            --enable SECCOMP_FILTER \
+            --enable CGROUPS \
+            --enable CGROUP_CPUACCT \
+            --enable CGROUP_DEVICE \
+            --enable CGROUP_FREEZER \
+            --enable CGROUP_SCHED \
+            --enable FAIR_GROUP_SCHED \
+            --enable RT_GROUP_SCHED \
+            --enable CGROUP_PIDS \
+            --enable CGROUP_BPF \
+            --enable MEMCG \
+            --enable MEMCG_SWAP \
+            --enable MEMCG_SWAP_ENABLED \
+            --enable MEMCG_KMEM \
+            --enable CPUSETS \
+            --enable BLK_CGROUP \
+            --enable DEVTMPFS \
+            --enable DEVTMPFS_MOUNT \
+            --enable TMPFS \
+            --enable TMPFS_POSIX_ACL \
+            --enable TMPFS_XATTR \
+            --enable OVERLAY_FS \
+            --enable EXT4_FS_POSIX_ACL \
+            --enable EXT4_FS_SECURITY \
+            --enable FUSE_FS \
+            --enable INOTIFY_USER \
+            --enable EPOLL \
+            --enable SIGNALFD \
+            --enable TIMERFD \
+            --enable EVENTFD \
+            --enable BPF_SYSCALL \
+            --enable NETFILTER \
+            --enable NETFILTER_ADVANCED \
+            --enable BRIDGE \
+            --enable BRIDGE_NETFILTER \
+            --enable VETH \
+            --enable MACVLAN \
+            --enable DUMMY \
+            --enable IP_MULTICAST \
+            --enable IP_ADVANCED_ROUTER \
+            --enable IP_NF_IPTABLES \
+            --enable IP_NF_FILTER \
+            --enable IP_NF_NAT \
+            --enable IP_NF_TARGET_MASQUERADE \
+            --enable IP6_NF_IPTABLES \
+            --enable IP6_NF_FILTER \
+            --enable IP6_NF_NAT \
+            --enable IP6_NF_TARGET_MASQUERADE \
+            --enable NETFILTER_XT_MATCH_ADDRTYPE \
+            --enable NETFILTER_XT_MATCH_COMMENT \
+            --enable NETFILTER_XT_MATCH_CONNTRACK \
+            --enable NETFILTER_XT_MARK \
+            --enable TUN
+
+          if [ "$ENABLE_KSU" = "true" ]; then
+            ./scripts/config --file out/.config \
+              --enable KSU \
+              --enable KPROBES \
+              --enable HAVE_KPROBES \
+              --enable KPROBE_EVENTS
+          fi
+
+          # 4. Sinkronisasi dependensi Kconfig
+          make $MAKE_ARGS olddefconfig
+
+      - name: Strict Verification of out/.config
+        working-directory: kernel
+        run: |
+          CFG=out/.config
+          fail=0
+          REQUIRED_OPTS=(
+            NAMESPACES UTS_NS IPC_NS USER_NS PID_NS NET_NS
+            CGROUPS CGROUP_FREEZER CGROUP_PIDS CGROUP_DEVICE MEMCG CPUSETS
+            SYSVIPC POSIX_MQUEUE OVERLAY_FS DEVTMPFS VETH BRIDGE
+          )
+          for s in "${REQUIRED_OPTS[@]}"; do
+            if grep -qx "CONFIG_${s}=y" "$CFG"; then
+              echo "OK      CONFIG_${s}=y"
+            else
+              echo "::error::CONFIG_${s}=y gagal diaktifkan di out/.config!"
+              fail=1
+            fi
+          done
+
+          if grep -qx "CONFIG_ANDROID_PARANOID_NETWORK=y" "$CFG"; then
+            echo "::error::CONFIG_ANDROID_PARANOID_NETWORK masih aktif!"
+            fail=1
+          else
+            echo "OK      CONFIG_ANDROID_PARANOID_NETWORK is disabled"
+          fi
+
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          SECONDS=0
+          make -j"$(nproc)" $MAKE_ARGS Image.gz-dtb 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          if [ ! -s "out/arch/arm64/boot/Image.gz-dtb" ] && [ ! -s "out/arch/arm64/boot/Image.gz" ]; then
+            echo "::error::Kernel image gagal dibuat!"
+            ls -la out/arch/arm64/boot || true
+            exit 1
+          fi
+          echo "Build selesai dalam $((SECONDS / 60)) menit"
+
+      - name: Package flashable zip (AnyKernel3)
+        run: |
+          SHA="$(git -C kernel rev-parse --short HEAD)"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cd AnyKernel3
+          rm -rf .git .github ./*.md
+
+          if [ -s "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz-dtb" ./Image.gz-dtb
+          else
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz" ./Image.gz
+          fi
+
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Droidspaces Container Kernel @KVER@ (@SHA@) - Blossom
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=blossom
+          device.name2=angelica
+          device.name3=angelican
+          device.name4=dandelion
+          device.name5=cattail
+          '; }
+
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          }
+
+          BLOCK=boot;
+          for p in /dev/block/bootdevice/by-name/boot /dev/block/platform/bootdevice/by-name/boot /dev/block/by-name/boot; do
+            if [ -e "$p" ]; then BLOCK="$p"; break; fi;
+          done;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+
+          sed -i "s|@KVER@|$KVER|g; s|@SHA@|$SHA|g" anykernel.sh
+          ZIP="Blossom-Droidspaces-Kernel-${KVER}-${SHA}-$(date -u +%Y%m%d).zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP" . -x '.git*' > /dev/null
+          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
+          echo "ZIP_PATH=$GITHUB_WORKSPACE/$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload .config and build log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            build.log
+            kernel/out/.config
+          if-no-files-found: ignore
