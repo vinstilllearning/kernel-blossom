@@ -1,0 +1,393 @@
+name: Build Redmi 9C Blossom Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: Kernel source repository URL
+        type: string
+        required: true
+        default: https://github.com/IsHacker-kernel/android_kernel_xiaomi_blossom
+      kernel_branch:
+        description: Kernel source branch
+        type: string
+        required: true
+        default: master
+      defconfig:
+        description: ARM64 defconfig name
+        type: string
+        required: true
+        default: blossom_defconfig
+      enable_ksu:
+        description: Enable KernelSU-Next (false keeps built-in KSU disabled for Magisk)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: Build non-GKI kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl flex git \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi libelf-dev libncurses-dev libssl-dev \
+            lz4 make pahole python3 python3-setuptools rsync unzip zip zlib1g-dev
+
+      - name: Clone kernel source and Proton Clang
+        shell: bash
+        env:
+          KERNEL_SOURCE: ${{ inputs.kernel_source }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "$KERNEL_SOURCE" != https://github.com/* ]]; then
+            echo "Kernel source must be an HTTPS GitHub URL." >&2
+            exit 1
+          fi
+          if [[ ! "$KERNEL_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Kernel branch contains unsupported characters." >&2
+            exit 1
+          fi
+
+          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
+            "$KERNEL_SOURCE" "$GITHUB_WORKSPACE/kernel"
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang \
+            "$RUNNER_TEMP/proton-clang"
+
+          if [[ ! -x "$RUNNER_TEMP/proton-clang/bin/clang" ]]; then
+            echo "Proton Clang was cloned, but bin/clang was not found." >&2
+            exit 1
+          fi
+          echo "$RUNNER_TEMP/proton-clang/bin" >> "$GITHUB_PATH"
+          echo "Kernel commit: $(git -C "$GITHUB_WORKSPACE/kernel" rev-parse --short HEAD)"
+
+      - name: Apply Droidspaces non-GKI patches and kernel compatibility fixes
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -euo pipefail
+          DROIDSPACES_DIR="$RUNNER_TEMP/Droidspaces-OSS"
+          PATCH_DIR="$DROIDSPACES_DIR/Documentation/resources/kernel-patches/non-GKI"
+
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS "$DROIDSPACES_DIR"
+          if [[ ! -d "$PATCH_DIR" ]]; then
+            echo "Droidspaces non-GKI patch directory was not found: $PATCH_DIR" >&2
+            exit 1
+          fi
+
+          mapfile -d '' -t PATCH_FILES < <(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -print0 | sort -z)
+          if (( ${#PATCH_FILES[@]} == 0 )); then
+            echo "No Droidspaces non-GKI patch files were found." >&2
+            exit 1
+          fi
+
+          for patch_file in "${PATCH_FILES[@]}"; do
+            patch_name="${patch_file##*/}"
+            if patch -p1 -R --dry-run -s -i "$patch_file" >/dev/null 2>&1; then
+              echo "Already applied; skipping: $patch_name"
+            else
+              echo "Applying patch: $patch_name"
+              if patch -p1 -N -F3 -s -i "$patch_file" >/dev/null 2>&1; then
+                echo "Applied: $patch_name"
+              else
+                # Some patches target kernel features absent from this tree (for example, xt_qtaguid).
+                # Keep the log annotation-free and continue with the remaining patches.
+                echo "Not applicable to this kernel tree; skipping: $patch_name"
+              fi
+            fi
+          done
+
+          # Allow USER_NS/PID_NS on this Android kernel instead of losing them at olddefconfig.
+          if [[ -f init/Kconfig ]]; then
+            sed -i '/^[[:space:]]*depends on !ANDROID[[:space:]]*$/d' init/Kconfig
+          else
+            echo "Expected Kconfig file init/Kconfig is missing." >&2
+            exit 1
+          fi
+
+          # GCC 10+ defaults to -fno-common; drop the duplicate yylloc definition
+          # from both the Flex source and its shipped generated counterpart.
+          for dtc_file in scripts/dtc/dtc-lexer.l scripts/dtc/dtc-lexer.lex.c_shipped; do
+            if [[ -f "$dtc_file" ]]; then
+              sed -i '/^[[:space:]]*YYLTYPE yylloc;[[:space:]]*$/d' "$dtc_file"
+            fi
+          done
+
+          # Ubuntu 22.04 host-tool compatibility fixes for SELinux headers/tools.
+          for selinux_file in scripts/selinux/genheaders/genheaders.c scripts/selinux/mdp/mdp.c; do
+            if [[ -f "$selinux_file" ]]; then
+              sed -i '/^[[:space:]]*#include <sys\/socket\.h>[[:space:]]*$/d' "$selinux_file"
+            else
+              echo "Expected SELinux host-tool source is missing: $selinux_file" >&2
+              exit 1
+            fi
+          done
+          if [[ -f security/selinux/include/classmap.h ]]; then
+            sed -i 's/^\([[:space:]]*\)#error New address family defined/\1\/\* #error New address family defined \*\//' \
+              security/selinux/include/classmap.h
+          else
+            echo "Expected SELinux class map is missing." >&2
+            exit 1
+          fi
+
+          # Use the Python 3 interpreter explicitly for legacy MediaTek helper scripts.
+          while IFS= read -r -d '' python_file; do
+            sed -i '1s|^#!/usr/bin/python$|#!/usr/bin/env python3|' "$python_file"
+          done < <(find . -path './.git' -prune -o -type f -name '*.py' -print0)
+
+      - name: Configure KernelSU mode
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        env:
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$ENABLE_KSU" == "true" ]]; then
+            # Remove the repository's bundled implementation before installing KernelSU-Next.
+            if [[ -e KernelSU || -L KernelSU ]]; then
+              rm -rf KernelSU
+            fi
+            if [[ -e drivers/kernelsu || -L drivers/kernelsu ]]; then
+              rm -rf drivers/kernelsu
+            fi
+
+            LEGACY_SETUP_URL="https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh"
+            OFFICIAL_SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+            SETUP_SCRIPT="$RUNNER_TEMP/kernelsu-next-setup.sh"
+
+            if curl -fLSs "$LEGACY_SETUP_URL" -o "$SETUP_SCRIPT" 2>/dev/null; then
+              bash "$SETUP_SCRIPT"
+            else
+              echo "Legacy KernelSU-Next installer URL is unavailable; using the official repository URL."
+              curl -fLSs "$OFFICIAL_SETUP_URL" | bash -
+            fi
+          else
+            # Keep the in-tree files, but disable the built-in KSU option in .config below.
+            echo "KernelSU-Next is disabled; the build will target Magisk compatibility."
+          fi
+
+      - name: Configure kernel options
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        env:
+          KERNEL_DEFCONFIG: ${{ inputs.defconfig }}
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+        run: |
+          set -euo pipefail
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KBUILD_HOSTCFLAGS=-fcommon
+            KCFLAGS=-Wno-error
+          )
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG"
+
+          CONFIG_OPTIONS=(
+            NAMESPACES UTS_NS IPC_NS USER_NS PID_NS NET_NS
+            CGROUPS CGROUP_FREEZER CGROUP_PIDS CGROUP_DEVICE CGROUP_CPUACCT CGROUP_SCHED
+            FAIR_GROUP_SCHED RT_GROUP_SCHED MEMCG MEMCG_SWAP MEMCG_SWAP_ENABLED MEMCG_KMEM
+            CPUSETS BLK_CGROUP DEVTMPFS DEVTMPFS_MOUNT TMPFS_POSIX_ACL OVERLAY_FS
+            EXT4_FS_POSIX_ACL EXT4_FS_SECURITY SYSVIPC POSIX_MQUEUE SECCOMP SECCOMP_FILTER
+            BRIDGE BRIDGE_NETFILTER VETH MACVLAN DUMMY IP_MULTICAST IP_ADVANCED_ROUTER
+            IP_NF_IPTABLES IP_NF_FILTER IP_NF_NAT IP_NF_TARGET_MASQUERADE
+            IP6_NF_IPTABLES IP6_NF_FILTER IP6_NF_NAT
+            NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_COMMENT NETFILTER_XT_MATCH_CONNTRACK
+            TUN MULTIUSER
+          )
+
+          for option in "${CONFIG_OPTIONS[@]}"; do
+            ./scripts/config --file out/.config --enable "$option"
+          done
+          ./scripts/config --file out/.config --disable ANDROID_PARANOID_NETWORK
+          ./scripts/config --file out/.config --disable WERROR
+
+          if [[ "$ENABLE_KSU" == "true" ]]; then
+            ./scripts/config --file out/.config --enable KSU
+            ./scripts/config --file out/.config --enable KPROBES
+            ./scripts/config --file out/.config --enable HAVE_KPROBES
+            ./scripts/config --file out/.config --enable KPROBE_EVENTS
+          else
+            ./scripts/config --file out/.config --disable KSU
+          fi
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" olddefconfig
+
+          for option in "${CONFIG_OPTIONS[@]}"; do
+            if ! grep -qx "CONFIG_${option}=y" out/.config; then
+              echo "Required Droidspaces option was not retained by olddefconfig: CONFIG_${option}" >&2
+              exit 1
+            fi
+          done
+          if [[ "$ENABLE_KSU" == "true" ]]; then
+            for option in KSU KPROBES HAVE_KPROBES KPROBE_EVENTS; do
+              if ! grep -qx "CONFIG_${option}=y" out/.config; then
+                echo "KernelSU mode requires CONFIG_${option}=y, but it was not retained." >&2
+                exit 1
+              fi
+            done
+          else
+            ./scripts/config --file out/.config --disable KSU
+            if ! grep -qx '# CONFIG_KSU is not set' out/.config; then
+              echo "KSU could not be disabled in out/.config." >&2
+              exit 1
+            fi
+          fi
+
+          echo "Final kernel configuration checks passed."
+
+      - name: Build kernel image
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -euo pipefail
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KBUILD_HOSTCFLAGS=-fcommon
+            KCFLAGS=-Wno-error
+          )
+
+          if make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz-dtb; then
+            echo "Image.gz-dtb build target completed."
+          else
+            echo "Image.gz-dtb target failed; trying the Image.gz fallback."
+            make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz
+          fi
+
+          if [[ -s out/arch/arm64/boot/Image.gz-dtb ]]; then
+            IMAGE_PATH="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz-dtb"
+          elif [[ -s out/arch/arm64/boot/Image.gz ]]; then
+            IMAGE_PATH="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz"
+          else
+            echo "Neither Image.gz-dtb nor Image.gz was produced." >&2
+            exit 1
+          fi
+          echo "KERNEL_IMAGE_PATH=$IMAGE_PATH" >> "$GITHUB_ENV"
+          echo "Built kernel image: $IMAGE_PATH"
+
+      - name: Package flashable AnyKernel3 ZIP
+        shell: bash
+        env:
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+        run: |
+          set -euo pipefail
+          ANYKERNEL_DIR="$RUNNER_TEMP/AnyKernel3"
+          PACKAGE_SUFFIX=Magisk
+          if [[ "$ENABLE_KSU" == "true" ]]; then
+            PACKAGE_SUFFIX=KernelSU-Next
+          fi
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 "$ANYKERNEL_DIR"
+          cp "$KERNEL_IMAGE_PATH" "$ANYKERNEL_DIR/$(basename "$KERNEL_IMAGE_PATH")"
+
+          python3 - "$ANYKERNEL_DIR/anykernel.sh" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          script = pathlib.Path(sys.argv[1])
+          content = script.read_text()
+
+          content, property_count = re.subn(
+              r"(?m)^do\.devicecheck=\d+\s*$",
+              "do.devicecheck=0",
+              content,
+              count=1,
+          )
+          if property_count != 1:
+              raise SystemExit("Could not set AnyKernel3 do.devicecheck=0")
+
+          # Do not rely on the example partition path shipped by AnyKernel3.
+          content, block_count = re.subn(
+              r"(?m)^BLOCK=.*$",
+              "BLOCK=;",
+              content,
+              count=1,
+          )
+          if block_count != 1:
+              raise SystemExit("Could not replace the AnyKernel3 BLOCK default")
+
+          content, slot_count = re.subn(
+              r"(?m)^IS_SLOT_DEVICE=.*$",
+              "IS_SLOT_DEVICE=0;",
+              content,
+              count=1,
+          )
+          if slot_count != 1:
+              raise SystemExit("Could not force the AnyKernel3 package to non-A/B mode")
+
+          source_line = ". tools/ak3-core.sh;"
+          detection = r'''. tools/ak3-core.sh;
+          # MediaTek / non-A-B: locate the boot partition by its by-name link.
+          for candidate in /dev/block/by-name/boot \
+                           /dev/block/bootdevice/by-name/boot \
+                           /dev/block/platform/*/by-name/boot \
+                           /dev/block/platform/*/*/by-name/boot \
+                           /dev/block/platform/*/*/*/by-name/boot \
+                           /dev/block/platform/*/*/*/*/by-name/boot; do
+            if [ -e "$candidate" ]; then
+              BLOCK="$candidate"
+              break
+            fi
+          done
+          [ -n "$BLOCK" ] || abort "Could not locate the boot partition under by-name/boot";'''
+          if source_line not in content:
+              raise SystemExit("Could not locate the AnyKernel3 core import line")
+          content = content.replace(source_line, detection, 1)
+          script.write_text(content)
+          PY
+
+          chmod 755 "$ANYKERNEL_DIR/anykernel.sh"
+          ZIP_NAME="Redmi9C-blossom-${PACKAGE_SUFFIX}-${GITHUB_RUN_NUMBER}.zip"
+          (
+            cd "$ANYKERNEL_DIR"
+            zip -qr9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x './.git/*' './.git/**'
+          )
+          echo "PACKAGE_PATH=$GITHUB_WORKSPACE/$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "Created flashable ZIP: $ZIP_NAME"
+
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: Redmi9C-blossom-kernel
+          path: ${{ github.workspace }}/Redmi9C-blossom-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
